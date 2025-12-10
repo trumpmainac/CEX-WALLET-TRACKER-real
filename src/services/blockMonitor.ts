@@ -61,8 +61,8 @@ export async function startBlockMonitor(rpc: RpcManager) {
   // Single shared monitor that watches all blocks
   (async () => {
     let lastSlot = 0;
-    const blockPollMin = Number(process.env.BLOCK_POLL_MIN_MS ?? 400);
-    const blockPollMax = Number(process.env.BLOCK_POLL_MAX_MS ?? 700);
+    const blockPollMin = Number(process.env.BLOCK_POLL_MIN_MS ?? 4);
+    const blockPollMax = Number(process.env.BLOCK_POLL_MAX_MS ?? 70);
 
     // Initialize to current slot on startup to avoid processing old blocks
     try {
@@ -86,7 +86,7 @@ export async function startBlockMonitor(rpc: RpcManager) {
             try {
               const blockData = await conn.getBlock(checkSlot, { maxSupportedTransactionVersion: 0 });
               if (!blockData || !blockData.transactions) {
-                await sleep(10); // Throttle requests
+                await sleep(1); // Throttle requests
                 continue;
               }
 
