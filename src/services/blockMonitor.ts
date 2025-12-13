@@ -61,8 +61,8 @@ export async function startBlockMonitor(rpc: RpcManager) {
   // Single shared monitor that watches all blocks
   (async () => {
     let lastSlot = 0;
-    const blockPollMin = Number(process.env.BLOCK_POLL_MIN_MS ?? 400);
-    const blockPollMax = Number(process.env.BLOCK_POLL_MAX_MS ?? 700);
+    const blockPollMin = Number(process.env.BLOCK_POLL_MIN_MS ?? 0);
+    const blockPollMax = Number(process.env.BLOCK_POLL_MAX_MS ?? 0);
 
     // Initialize to current slot on startup to avoid processing old blocks
     try {
@@ -73,6 +73,9 @@ export async function startBlockMonitor(rpc: RpcManager) {
       log('Warning: Could not initialize starting slot, will start from next available');
     }
 
+    const blockFetchConcurrency = Number(process.env.BLOCK_FETCH_CONCURRENCY ?? 16);
+    log(`Block fetch concurrency set to ${blockFetchConcurrency}`);
+
     while (true) {
       try {
         const conn = rpc.getConnection();
@@ -80,56 +83,98 @@ export async function startBlockMonitor(rpc: RpcManager) {
 
         if (slot > lastSlot) {
           // Process ALL blocks between lastSlot and current slot (fill gaps from skipped slots)
-          for (let checkSlot = lastSlot + 1; checkSlot <= slot; checkSlot++) {
-            log(`Processing block ${checkSlot}...`);
+          const slotsToProcess: number[] = [];
+          for (let s = lastSlot + 1; s <= slot; s++) slotsToProcess.push(s);
 
-            try {
-              const blockData = await conn.getBlock(checkSlot, { maxSupportedTransactionVersion: 0 });
-              if (!blockData || !blockData.transactions) {
-                await sleep(100); // Throttle requests
-                continue;
+          // Process in concurrent batches to catch up faster (user accepts rate-limiting errors)
+          for (let i = 0; i < slotsToProcess.length; i += blockFetchConcurrency) {
+            const batch = slotsToProcess.slice(i, i + blockFetchConcurrency);
+            log(`Fetching batch slots [${batch[0]}..${batch[batch.length - 1]}] (size=${batch.length})`);
+
+            // Fetch all blocks in parallel, but buffer results so we can process in order
+            const fetches = batch.map(async (s) => {
+              try {
+                const blockData = await conn.getBlock(s, { maxSupportedTransactionVersion: 0 });
+                return { slot: s, blockData, err: null as any };
+              } catch (err: any) {
+                return { slot: s, blockData: null as any, err };
+              }
+            });
+
+            const results = await Promise.all(fetches);
+            const resultsBySlot = new Map<number, { slot: number; blockData: any; err: any }>();
+            for (const r of results) resultsBySlot.set(r.slot, r);
+
+            // Process batch slots in ascending order, but only advance lastSlot for
+            // contiguous slots that are processed or legitimately skipped.
+            let processedUpTo = lastSlot;
+            for (const s of batch) {
+              const res = resultsBySlot.get(s)!;
+              if (res.err) {
+                const msg = String(res.err?.message ?? res.err);
+                // Treat skipped/missing-in-long-term-storage as processed (they won't appear later)
+                if (msg.includes('skipped') || msg.includes('missing in long-term storage')) {
+                  log(`Slot ${s} skipped or missing in long-term storage`);
+                  processedUpTo = s;
+                  continue;
+                }
+
+                // Transient error (rate limit, RPC error) — stop advancing further to preserve order
+                error(`Error fetching block ${s}:`, msg);
+                break;
               }
 
-              // Process all transactions in this block
-              for (const tx of blockData.transactions) {
-                const signature = tx.transaction.signatures[0];
-                if (!signature) continue;
+              // No block data (not produced yet)
+              if (!res.blockData || !res.blockData.transactions) {
+                // not produced yet; stop — we'll try again next loop
+                break;
+              }
 
-                // Parse transaction for each CEX wallet
-                for (const cfg of configs) {
-                  const ranges = parseRanges(cfg.ranges);
-                  const cexPubkey = cfg.address;
+              // We have a valid block — process it sequentially to preserve order
+              log(`Processing block ${s}...`);
+              try {
+                const blockData = res.blockData;
+                for (const tx of blockData.transactions) {
+                  const signature = tx.transaction.signatures[0];
+                  if (!signature) continue;
 
-                  const outflows = parseBlockTransactions(tx as any, cexPubkey);
-                  
-                  if (outflows.length > 0) {
-                    log(`[${cfg.label}] Found ${outflows.length} outflow(s) in tx ${signature.slice(0, 8)}...`);
-                  }
-                  
-                  for (const outflow of outflows) {
-                    log(`[${cfg.label}] Outflow: ${outflow.amount} SOL to ${outflow.receiver.slice(0, 8)}...`);
-                    
-                    if (!amountMatchesRanges(outflow.amount, ranges)) {
-                      log(`[${cfg.label}] Amount ${outflow.amount} SOL does NOT match ranges: ${cfg.ranges}`);
-                      continue;
+                  for (const cfg of configs) {
+                    const ranges = parseRanges(cfg.ranges);
+                    const outflows = parseBlockTransactions(tx as any, cfg.address);
+
+                    if (outflows.length > 0) {
+                      log(`[${cfg.label}] Found ${outflows.length} outflow(s) in tx ${signature.slice(0, 8)}...`);
                     }
 
-                    const solscanLink = `https://solscan.io/tx/${signature}`;
-                    const message = `<b>🚨 Range Match Alert</b>\n<b>CEX:</b> ${cfg.label}\n<b>Amount:</b> ${outflow.amount} SOL\n<b>Receiver:</b> ${outflow.receiver}\n<b>Tx:</b> <a href="${solscanLink}">View on Solscan</a>`;
-                    log(`ALERT: ${cfg.label} sent ${outflow.amount} SOL to ${outflow.receiver}`);
-                    await sendAlert(message);
+                    for (const outflow of outflows) {
+                      log(`[${cfg.label}] Outflow: ${outflow.amount} SOL to ${outflow.receiver.slice(0, 8)}...`);
+                      if (!amountMatchesRanges(outflow.amount, ranges)) {
+                        log(`[${cfg.label}] Amount ${outflow.amount} SOL does NOT match ranges: ${cfg.ranges}`);
+                        continue;
+                      }
+
+                      const solscanLink = `https://solscan.io/tx/${signature}`;
+                      const message = `<b>🚨 Range Match Alert</b>\n<b>CEX:</b> ${cfg.label}\n<b>Amount:</b> ${outflow.amount} SOL\n<b>Receiver:</b> ${outflow.receiver}\n<b>Tx:</b> <a href="${solscanLink}">View on Solscan</a>`;
+                      log(`ALERT: ${cfg.label} sent ${outflow.amount} SOL to ${outflow.receiver}`);
+                      await sendAlert(message);
+                    }
                   }
                 }
+                // Successfully processed this slot
+                processedUpTo = s;
+              } catch (err: any) {
+                error(`Error processing block ${s}:`, err?.message ?? err);
+                // stop advancing on processing error to preserve order
+                break;
               }
+            }
 
-              await sleep(100); // Throttle requests between blocks
-            } catch (err: any) {
-              error(`Error processing block ${checkSlot}:`, err?.message ?? err);
-              await sleep(100);
+            // Advance lastSlot only up to the last contiguous processed/skipped slot
+            if (processedUpTo > lastSlot) {
+              log(`Advanced lastSlot from ${lastSlot} to ${processedUpTo}`);
+              lastSlot = processedUpTo;
             }
           }
-
-          lastSlot = slot;
         }
 
         const ms = blockPollMin + Math.random() * (blockPollMax - blockPollMin);
