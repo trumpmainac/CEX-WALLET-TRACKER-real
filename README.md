@@ -202,4 +202,33 @@ MIT
 ## Support
 
 For issues or questions, open an issue on GitHub.
+# Quick Download (single-file zip)
+
+If you just want a ready-to-run zip of the current working `main` (includes compiled `dist/`):
+
+Windows (PowerShell):
+
+```powershell
+# unzip into a folder
+Expand-Archive CEX-WALLET-TRACKER-real-main.zip -DestinationPath CEX-WALLET-TRACKER
+cd CEX-WALLET-TRACKER
+# install deps
+npm ci
+# run
+node dist/index.js
+```
+
+Linux / macOS:
+
+```bash
+unzip CEX-WALLET-TRACKER-real-main.zip -d CEX-WALLET-TRACKER
+cd CEX-WALLET-TRACKER
+npm ci
+node dist/index.js
+```
+
+Notes:
+- Ensure you create a `.env` file in the project root (copy from `.env.example`) and fill in `RPC_PRIMARY`, `CEX_n_ADDRESS`, and `TELEGRAM_*` if you want alerts.
+- To tune concurrency, set `BLOCK_FETCH_CONCURRENCY` in `.env` (e.g., `BLOCK_FETCH_CONCURRENCY=30`).
+
 # CEX-WALLET-TRACKER-real
