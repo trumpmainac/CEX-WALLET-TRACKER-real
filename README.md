@@ -90,6 +90,20 @@ Or run with TypeScript directly (requires ts-node):
 npm run dev
 ```
 
+Listener-based mode (WebSocket)
+--------------------------------
+
+A listener-based entry point is available that uses WebSocket slot updates for lower-latency, near-real-time processing.
+
+Build and run the listener:
+
+```bash
+npm run build
+npm run start-listener
+```
+
+Use `npm run dev-listener` to run the listener in TypeScript during development.
+
 ## Deployment on Render
 
 ### Step 1: Push to GitHub
